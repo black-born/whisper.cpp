@@ -24,6 +24,7 @@ build-sanitize-thread/
 /talk-llama
 /bench
 /quantize
+/fr_core_news_lg-3.5.0
 
 arm_neon.h
 sync.sh

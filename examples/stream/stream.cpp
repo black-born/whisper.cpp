@@ -7,6 +7,8 @@
 #include "common-sdl.h"
 #include "whisper.h"
 
+#include <Python.h>
+#include <pyhelper.hpp>
 #include <cassert>
 #include <cstdio>
 #include <string>
@@ -31,14 +33,14 @@ std::string to_timestamp(int64_t t) {
 // command-line parameters
 struct whisper_params {
     int32_t n_threads  = std::min(4, (int32_t) std::thread::hardware_concurrency());
-    int32_t step_ms    = 3000;
+    int32_t step_ms    = 5000;
     int32_t length_ms  = 10000;
     int32_t keep_ms    = 200;
     int32_t capture_id = -1;
     int32_t max_tokens = 32;
     int32_t audio_ctx  = 0;
 
-    float vad_thold    = 0.6f;
+    float vad_thold    = 5000.0f;
     float freq_thold   = 100.0f;
 
     bool speed_up      = false;
@@ -50,7 +52,7 @@ struct whisper_params {
     bool tinydiarize   = false;
 
     std::string language  = "en";
-    std::string model     = "models/ggml-base.en.bin";
+    std::string model     = "assets/models/ggml-base.en.bin";
     std::string fname_out;
 };
 
@@ -121,7 +123,38 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
 }
 
 int main(int argc, char ** argv) {
+
     whisper_params params;
+    CPyInstance hInstance;
+    PyObject* sysPath = PySys_GetObject((char*)"path");
+
+    if (sysPath != NULL) {
+        PyList_Append(sysPath, PyUnicode_FromString("."));
+    } else {
+        PyErr_Print();
+        fprintf(stderr, "Failed to append to sys.path\n");
+        return 1;
+    }
+
+    CPyObject pName = PyUnicode_DecodeFSDefault("form_filling");
+    CPyObject pModule = PyImport_Import(pName);
+    Py_XDECREF(pName);
+    Py_XDECREF(sysPath);
+
+    if(pModule) {
+        CPyObject pFunc = PyObject_GetAttrString(pModule, "to_file");
+        if (!(pFunc && PyCallable_Check(pFunc))) {
+            printf("ERROR: function to_file()\n");
+            return 1;
+        }
+    }
+
+    else {
+        printf("ERROR: Module not imported\n");
+        return 1;
+    }
+
+    CPyObject pFunc = PyObject_GetAttrString(pModule, "to_file");
 
     if (whisper_params_parse(argc, argv, params) == false) {
         return 1;
@@ -215,8 +248,9 @@ int main(int argc, char ** argv) {
     printf("[Start speaking]");
     fflush(stdout);
 
-          auto t_last  = std::chrono::high_resolution_clock::now();
+    auto t_last  = std::chrono::high_resolution_clock::now();
     const auto t_start = t_last;
+
 
     // main audio loop
     while (is_running) {
@@ -224,6 +258,7 @@ int main(int argc, char ** argv) {
         is_running = sdl_poll_events();
 
         if (!is_running) {
+            hInstance.~CPyInstance();
             break;
         }
 
@@ -380,8 +415,34 @@ int main(int argc, char ** argv) {
             ++n_iter;
 
             if (!use_vad && (n_iter % n_new_line) == 0) {
+                
                 printf("\n");
-
+                const int n_segments = whisper_full_n_segments(ctx);
+                const char * text = whisper_full_get_segment_text(ctx, n_segments - 1);
+                //printf("%s\n", text);
+                //printf("core dumped incomming0\n");
+                //printf("core dumped incomming1\n");
+                PyObject* textpy = PyUnicode_FromString(text);
+                PyObject* pArgs = PyTuple_Pack(1, textpy);
+                if (!textpy) {
+                    PyErr_Print();
+                    fprintf(stderr, "Cannot convert argument to Python string\n");
+                    Py_DECREF(pArgs);
+                    Py_DECREF(textpy);
+                }
+                //printf("core dumped incomming2\n");
+                //printf("core dumped incomming3\n");
+                PyObject* pReturnValue = PyObject_CallObject(pFunc, pArgs);
+                //printf("core dumped incomming4\n");
+                if (pReturnValue != NULL) {
+                    printf("Returned value from my_function: %s\npArgs: %s\ntextpy: %s\n", PyUnicode_AsUTF8(pReturnValue), PyUnicode_AsUTF8(pArgs), PyUnicode_AsUTF8(textpy));
+                    PyErr_Print();
+                    Py_DECREF(pReturnValue);
+                } else {
+                    PyErr_Print();
+                }
+                Py_DECREF(pArgs);
+                Py_DECREF(textpy);
                 // keep part of the audio for next iteration to try to mitigate word boundary issues
                 pcmf32_old = std::vector<float>(pcmf32.end() - n_samples_keep, pcmf32.end());
 
