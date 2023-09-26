@@ -58,7 +58,7 @@ bool whisper_params_parse(int argc, std::vector<std::string> argv, whisper_param
 void whisper_print_usage(int /*argc*/, std::vector<std::string> argv, const whisper_params & params);
 
 extern "C" {
-JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBuffer_processCircularBuffer(JNIEnv *env, jobject circularBufferInstance, int argc, jobjectArray parameters);
+JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBuffer_processCircularBuffer(JNIEnv *env, jobject circularBufferInstance, int argc, jobjectArray parameters, jobject directBuffer);
 }
 
 #endif //WHISPERCPPSTREAMING_STREAM_H
