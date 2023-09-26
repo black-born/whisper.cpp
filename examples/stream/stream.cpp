@@ -127,7 +127,7 @@ extern "C" {
     }
 }
 
-extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBuffer_processCircularBuffer(JNIEnv *env, jobject circularBufferInstance, int argc, jobjectArray parameters) {
+extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBuffer_processCircularBuffer(JNIEnv *env, jobject circularBufferInstance, int argc, jobjectArray parameters, jobject directBuffer) {
 
     whisper_params params;
 
@@ -196,11 +196,24 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
         exit(0);
     }
 
-    __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s%s", "Current path ", std::__fs::filesystem::current_path().c_str());
-    for (const auto & entry : std::__fs::filesystem::directory_iterator(std::__fs::filesystem::current_path().c_str()))
-        __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s%s", "Available directory: ", entry.path().c_str());
-    __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s%s", "trying to find model here ", params.model.c_str());
-    struct whisper_context * ctx = whisper_init_from_file(params.model.c_str());
+    //__android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s%s", "Current path ", std::__fs::filesystem::current_path().c_str());
+    //for (const auto & entry : std::__fs::filesystem::directory_iterator(std::__fs::filesystem::current_path().c_str()))
+        //__android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s%s", "Available directory: ", entry.path().c_str());
+    //__android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s%s", "trying to find model here ", params.model.c_str());
+
+    jlong bufferAddress = reinterpret_cast<jlong>(env->GetDirectBufferAddress(directBuffer));
+    jlong bufferCapacity = env->GetDirectBufferCapacity(directBuffer);
+
+    if (bufferAddress == 0 || bufferCapacity <= 0) {
+        return 0; // Return nullptr equivalent
+    }
+
+    void* buffer = reinterpret_cast<void*>(bufferAddress);
+
+    // Call whisper_init_from_buffer or your corresponding C++ function
+    struct whisper_context* ctx = whisper_init_from_buffer(buffer, static_cast<size_t>(bufferCapacity));
+
+    // struct whisper_context * ctx = whisper_init_from_file(params.model.c_str());
     if (ctx == nullptr) {__android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "failed to find model here");}
     else {__android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Success");}
     std::vector<float> pcmf32    (n_samples_30s, 0.0f);
