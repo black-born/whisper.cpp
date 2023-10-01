@@ -6,6 +6,8 @@
 #include "common.h"
 #include "whisper.h"
 #include "stream.h"
+#include "whisper.h"
+#include "ggml.h"
 #include <jni.h>
 
 #include <cassert>
@@ -19,11 +21,60 @@
 #include <string>
 #include <deque>
 #include <android/log.h>
+#include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
+#include <stdlib.h>
+#include <sys/sysinfo.h>
+#include <string.h>
+#include <atomic>
+
+#define UNUSED(x) (void)(x)
+#define TAG "Transcribing"
+
+#define LOGV(...) __android_log_print(ANDROID_LOG_VERBOSE,     TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,     TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR,     TAG, __VA_ARGS__)
+
+
+static size_t asset_read(void *ctx, void *output, size_t read_size) {
+    return AAsset_read((AAsset *) ctx, output, read_size);
+}
+
+static bool asset_is_eof(void *ctx) {
+    return AAsset_getRemainingLength64((AAsset *) ctx) <= 0;
+}
+
+static void asset_close(void *ctx) {
+    AAsset_close((AAsset *) ctx);
+}
+
+static struct whisper_context *whisper_init_from_asset(
+        JNIEnv *env,
+        jobject assetManager,
+        const char *asset_path
+) {
+    LOGV("Loading model from asset '%s'\n", asset_path);
+    AAssetManager *asset_manager = AAssetManager_fromJava(env, assetManager);
+    AAsset *asset = AAssetManager_open(asset_manager, asset_path, AASSET_MODE_STREAMING);
+    if (!asset) {
+        LOGW("Failed to open '%s'\n", asset_path);
+        return NULL;
+    }
+
+    whisper_model_loader loader = {
+            .context = asset,
+            .read = &asset_read,
+            .eof = &asset_is_eof,
+            .close = &asset_close
+    };
+
+    return whisper_init(&loader);
+}
 
 std::queue<std::string> sentenceQueue;
 std::mutex queueMutex;
 std::condition_variable conditionVar;
+std::atomic<bool>* stopLoopFlag = new std::atomic<bool>(false);
 
 //  500 -> 00:05.000
 // 6000 -> 01:00.000
@@ -34,8 +85,8 @@ std::string to_timestamp(int64_t t) {
     sec = sec - min*60;
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "%02d:%02d.%03d", (int) min, (int) sec, (int) msec);
-
+    //snprintf(buf, sizeof(buf), "%02d:%02d.%03d", (int) min, (int) sec, (int) msec);
+    LOGV("%s %d %02d:%02d.%03d", buf, sizeof(buf), (int) min, (int) sec, (int) msec); // Constructor not found
     return std::string(buf);
 }
 
@@ -67,7 +118,8 @@ bool whisper_params_parse(int argc, std::vector<std::string> argv, whisper_param
         else if (arg == "-tdrz" || arg == "--tinydiarize")  { params.tinydiarize   = true; }
 
         else {
-            fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
+            //fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
+            LOGE("error: unknown argument: %s", arg.c_str()); // Constructor not found
             whisper_print_usage(argc, argv, params);
             exit(0);
         }
@@ -76,58 +128,52 @@ bool whisper_params_parse(int argc, std::vector<std::string> argv, whisper_param
 }
 
 void whisper_print_usage(int /*argc*/, std::vector<std::string> argv, const whisper_params & params) {
-    fprintf(stderr, "\n");
-    fprintf(stderr, "usage: %s [options]\n", argv[0].c_str());
-    fprintf(stderr, "\n");
-    fprintf(stderr, "options:\n");
-    fprintf(stderr, "  -h,       --help          [default] show this help message and exit\n");
-    fprintf(stderr, "  -t N,     --threads N     [%-7d] number of threads to use during computation\n",    params.n_threads);
-    fprintf(stderr, "            --step N        [%-7d] audio step size in milliseconds\n",                params.step_ms);
-    fprintf(stderr, "            --length N      [%-7d] audio length in milliseconds\n",                   params.length_ms);
-    fprintf(stderr, "            --keep N        [%-7d] audio to keep from previous step in ms\n",         params.keep_ms);
-    fprintf(stderr, "  -c ID,    --capture ID    [%-7d] capture device ID\n",                              params.capture_id);
-    fprintf(stderr, "  -mt N,    --max-tokens N  [%-7d] maximum number of tokens per audio chunk\n",       params.max_tokens);
-    fprintf(stderr, "  -ac N,    --audio-ctx N   [%-7d] audio context size (0 - all)\n",                   params.audio_ctx);
-    fprintf(stderr, "  -vth N,   --vad-thold N   [%-7.2f] voice activity detection threshold\n",           params.vad_thold);
-    fprintf(stderr, "  -fth N,   --freq-thold N  [%-7.2f] high-pass frequency cutoff\n",                   params.freq_thold);
-    fprintf(stderr, "  -su,      --speed-up      [%-7s] speed up audio by x2 (reduced accuracy)\n",        params.speed_up ? "true" : "false");
-    fprintf(stderr, "  -tr,      --translate     [%-7s] translate from source language to english\n",      params.translate ? "true" : "false");
-    fprintf(stderr, "  -nf,      --no-fallback   [%-7s] do not use temperature fallback while decoding\n", params.no_fallback ? "true" : "false");
-    fprintf(stderr, "  -ps,      --print-special [%-7s] print special tokens\n",                           params.print_special ? "true" : "false");
-    fprintf(stderr, "  -kc,      --keep-context  [%-7s] keep context between audio chunks\n",              params.no_context ? "false" : "true");
-    fprintf(stderr, "  -l LANG,  --language LANG [%-7s] spoken language\n",                                params.language.c_str());
-    fprintf(stderr, "  -m FNAME, --model FNAME   [%-7s] model path\n",                                     params.model.c_str());
-    fprintf(stderr, "  -f FNAME, --file FNAME    [%-7s] text output file name\n",                          params.fname_out.c_str());
-    fprintf(stderr, "  -tdrz,     --tinydiarize  [%-7s] enable tinydiarize (requires a tdrz model)\n",     params.tinydiarize ? "true" : "false");
-    fprintf(stderr, "\n");
+    LOGV("\n");
+    LOGV("usage: %s [options]\n", argv[0].c_str());
+    LOGV("\n");
+    LOGV("options:\n");
+    LOGV("  -h,       --help          [default] show this help message and exit\n");
+    LOGV("  -t N,     --threads N     [%-7d] number of threads to use during computation\n",    params.n_threads);
+    LOGV("            --step N        [%-7d] audio step size in milliseconds\n",                params.step_ms);
+    LOGV("            --length N      [%-7d] audio length in milliseconds\n",                   params.length_ms);
+    LOGV("            --keep N        [%-7d] audio to keep from previous step in ms\n",         params.keep_ms);
+    LOGV("  -c ID,    --capture ID    [%-7d] capture device ID\n",                              params.capture_id);
+    LOGV("  -mt N,    --max-tokens N  [%-7d] maximum number of tokens per audio chunk\n",       params.max_tokens);
+    LOGV("  -ac N,    --audio-ctx N   [%-7d] audio context size (0 - all)\n",                   params.audio_ctx);
+    LOGV("  -vth N,   --vad-thold N   [%-7.2f] voice activity detection threshold\n",           params.vad_thold);
+    LOGV("  -fth N,   --freq-thold N  [%-7.2f] high-pass frequency cutoff\n",                   params.freq_thold);
+    LOGV("  -su,      --speed-up      [%-7s] speed up audio by x2 (reduced accuracy)\n",        params.speed_up ? "true" : "false");
+    LOGV("  -tr,      --translate     [%-7s] translate from source language to english\n",      params.translate ? "true" : "false");
+    LOGV("  -nf,      --no-fallback   [%-7s] do not use temperature fallback while decoding\n", params.no_fallback ? "true" : "false");
+    LOGV("  -ps,      --print-special [%-7s] print special tokens\n",                           params.print_special ? "true" : "false");
+    LOGV("  -kc,      --keep-context  [%-7s] keep context between audio chunks\n",              params.no_context ? "false" : "true");
+    LOGV("  -l LANG,  --language LANG [%-7s] spoken language\n",                                params.language.c_str());
+    LOGV("  -m FNAME, --model FNAME   [%-7s] model path\n",                                     params.model.c_str());
+    LOGV("  -f FNAME, --file FNAME    [%-7s] text output file name\n",                          params.fname_out.c_str());
+    LOGV("  -tdrz,     --tinydiarize  [%-7s] enable tinydiarize (requires a tdrz model)\n",     params.tinydiarize ? "true" : "false");
+    LOGV("\n");
 }
 
-extern "C" {
-    JNIEXPORT void JNICALL Java_com_example_whispercppstreaming_CircularBuffer_shortArrayToVector(JNIEnv *env, jshortArray shortArray, std::vector<float> floatVector, int n_samples_30s) {
-        // Get the length of the ShortArray
-        jsize length = env->GetArrayLength(shortArray);
+void byteArrayToFloatVector(JNIEnv *env, jbyteArray byteArray, std::vector<float>& floatVector, int n_samples_30s) {
+    jsize length = env->GetArrayLength(byteArray);
+    jbyte* byteArrayElements = env->GetByteArrayElements(byteArray, NULL);
 
-        // Get a pointer to the C-style array
-        jshort* shortArrayElements = env->GetShortArrayElements(shortArray, nullptr);
-
-        // Create a std::vector<float> to store the converted values
-        floatVector = std::vector<float>(n_samples_30s, 0.0f);
-
-        // Iterate through the ShortArray and convert each short to float
-        for (int i = 0; i < length; i++) {
-            float floatValue = static_cast<float>(shortArrayElements[i]);
-            floatVector.push_back(floatValue);
-        }
-
-        // Release the C-style array (important!)
-        env->ReleaseShortArrayElements(shortArray, shortArrayElements, 0);
-
-        // Now 'floatVector' contains the converted values as a std::vector<float>
-        // You can use 'floatVector' as needed in your C++ code
+    for (int i = 0; i < length; i += sizeof(float)) {
+        float floatValue;
+        // Assuming little-endian byte order
+        memcpy(&floatValue, &byteArrayElements[i], sizeof(float));
+        floatVector.push_back(floatValue);
     }
+    LOGV("vector size: %d", floatVector.size());
+    env->ReleaseByteArrayElements(byteArray, byteArrayElements, JNI_ABORT);
 }
 
-extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBuffer_processCircularBuffer(JNIEnv *env, jobject circularBufferInstance, int argc, jobjectArray parameters, jobject directBuffer) {
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_whispercppstreaming_HomeFragment_stopLoop(JNIEnv *env, jobject /* this */) {
+    stopLoopFlag->store(true); // Stop the loop using the pointer
+}
+
+extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBuffer_processCircularBuffer(JNIEnv *env, jobject circularBufferInstance, int argc, jobjectArray parameters, jobject assetManager, jstring assetPathStr) {
 
     whisper_params params;
 
@@ -154,12 +200,12 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
     jclass circularBuffer = env->FindClass("com/example/whispercppstreaming/CircularBuffer");
     jmethodID get = env->GetMethodID(circularBuffer, "get", "(I)[B");
     if (get == nullptr) {
-        __android_log_print(ANDROID_LOG_ERROR, "Transcribing", "%s", "Circular buffer get method not found"); // Constructor not found
+        LOGE("%s", "Circular buffer get method not found"); // Constructor not found
         return 1;
     }
     jmethodID clear = env->GetMethodID(circularBuffer, "clear", "()V");
     if (clear == nullptr) {
-        __android_log_print(ANDROID_LOG_ERROR, "Transcribing", "%s", "Circular buffer clear method not found"); // Constructor not found
+        LOGE("%s", "Circular buffer clear method not found"); // Constructor not found
         return 1;
     }
 
@@ -191,56 +237,41 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
     // whisper init
 
     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1){
-        fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
+        LOGE("error: unknown language '%s'\n", params.language.c_str());
         whisper_print_usage(argc, argv, params);
         exit(0);
     }
 
-    //__android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s%s", "Current path ", std::__fs::filesystem::current_path().c_str());
+    //LOGV"%s%s", "Current path ", std::__fs::filesystem::current_path().c_str());
     //for (const auto & entry : std::__fs::filesystem::directory_iterator(std::__fs::filesystem::current_path().c_str()))
-        //__android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s%s", "Available directory: ", entry.path().c_str());
-    //__android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s%s", "trying to find model here ", params.model.c_str());
+        //LOGV"%s%s", "Available directory: ", entry.path().c_str());
+    //LOGV"%s%s", "trying to find model here ", params.model.c_str());
 
-    jlong bufferAddress = reinterpret_cast<jlong>(env->GetDirectBufferAddress(directBuffer));
-    jlong bufferCapacity = env->GetDirectBufferCapacity(directBuffer);
+    //struct whisper_context * ctx = whisper_init_from_file(params.model.c_str());
 
-    if (bufferAddress == 0 || bufferCapacity <= 0) {
-        return 0; // Return nullptr equivalent
-    }
+    struct whisper_context *ctx = NULL;
+    const char *asset_path_chars = (*env).GetStringUTFChars(assetPathStr, JNI_FALSE);
+    ctx = whisper_init_from_asset(env, assetManager, asset_path_chars);
+    (*env).ReleaseStringUTFChars(assetPathStr, asset_path_chars);
 
-    void* buffer = reinterpret_cast<void*>(bufferAddress);
-
-    // Call whisper_init_from_buffer or your corresponding C++ function
-    struct whisper_context* ctx = whisper_init_from_buffer(buffer, static_cast<size_t>(bufferCapacity));
-
-    // struct whisper_context * ctx = whisper_init_from_file(params.model.c_str());
-    if (ctx == nullptr) {__android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "failed to find model here");}
-    else {__android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Success");}
-    std::vector<float> pcmf32    (n_samples_30s, 0.0f);
+    if (ctx == nullptr) {LOGV("%s", "failed to find model here");}
+    else {LOGV("%s", "Model load Successfully");}
+    std::vector<float> pcmf32;
     std::vector<float> pcmf32_old;
-    std::vector<float> pcmf32_new(n_samples_30s, 0.0f);
+    std::vector<float> pcmf32_new;
 
     std::vector<whisper_token> prompt_tokens;
 
-    __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Step 2 done");
-
     // print some info about the processing
     {
-        __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Step 2.1 Starting");
-        fprintf(stderr, "\n");
-        __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Step 2.11 done");
+        LOGV("\n");
         if (!whisper_is_multilingual(ctx)) {
-            __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Step 2.12 done");
             if (params.language != "en" || params.translate) {
-                __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Step 2.13 done");
                 params.language = "en";
                 params.translate = false;
-                fprintf(stderr, "%s: WARNING: model is not multilingual, ignoring language and translation options\n", __func__);
             }
         }
-        __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Step 2.1 done");
-        fprintf(stderr, "%s: processing %d samples (step = %.1f sec / len = %.1f sec / keep = %.1f sec), %d threads, lang = %s, task = %s, timestamps = %d ...\n",
-                __func__,
+        LOGV("processing %d samples (step = %.1f sec / len = %.1f sec / keep = %.1f sec), %d threads, lang = %s, task = %s, timestamps = %d ...\n",
                 n_samples_step,
                 float(n_samples_step)/WHISPER_SAMPLE_RATE,
                 float(n_samples_len )/WHISPER_SAMPLE_RATE,
@@ -251,65 +282,70 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
                 params.no_timestamps ? 0 : 1);
 
         if (!use_vad) {
-            fprintf(stderr, "%s: n_new_line = %d, no_context = %d\n", __func__, n_new_line, params.no_context);
+            LOGV("n_new_line = %d, no_context = %d\n", n_new_line, params.no_context);
         } else {
-            fprintf(stderr, "%s: using VAD, will transcribe on speech activity\n", __func__);
+            LOGV("using VAD, will transcribe on speech activity\n");
         }
 
-        fprintf(stderr, "\n");
+        LOGV("\n");
     }
 
     int n_iter = 0;
 
-    bool is_running = true;
-    __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Step 2.2 done");
     std::ofstream fout;
     if (params.fname_out.length() > 0) {
         fout.open(params.fname_out);
         if (!fout.is_open()) {
-            fprintf(stderr, "%s: failed to open output file '%s'!\n", __func__, params.fname_out.c_str());
+            LOGE("failed to open output file '%s'!\n", params.fname_out.c_str());
             return 1;
         }
     }
-    __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Step 2.3 done");
 
-    printf("[Start speaking]");
-    fflush(stdout);
-    __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Step 2.4 done");
-          auto t_last  = std::chrono::high_resolution_clock::now();
+    LOGV("[Start speaking]");
+    //fflush(stdout);
+    auto t_last  = std::chrono::high_resolution_clock::now();
     const auto t_start = t_last;
 
-    __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Step 3 done");
 
     // main audio loop
-    while (is_running) {
+    while (!stopLoopFlag->load()) {
 
-        if (!is_running) {
-            break;
+        if (stopLoopFlag->load()) {
+            __android_log_print(ANDROID_LOG_VERBOSE, "Stopping", "Transcribing successfully stopped");
+            whisper_free(ctx);
+            return 0;
         }
 
         // process new audio
 
         if (!use_vad) {
             while (true) {
-                jshortArray audio = (jshortArray)env->CallObjectMethod(circularBufferInstance, get, params.step_ms);
-                Java_com_example_whispercppstreaming_CircularBuffer_shortArrayToVector(env, audio, pcmf32_new, n_samples_30s);
+
+                if (stopLoopFlag->load()) {
+                    __android_log_print(ANDROID_LOG_VERBOSE, "Stopping", "Transcribing successfully stopped");
+                    whisper_free(ctx);
+                    return 0;
+                }
+                jbyteArray audio = (jbyteArray)env->CallObjectMethod(circularBufferInstance, get, params.step_ms);
+                byteArrayToFloatVector(env, audio, pcmf32_new, n_samples_30s);
 
                 if ((int) pcmf32_new.size() > 2*n_samples_step) {
-                    fprintf(stderr, "\n\n%s: WARNING: buffer full, cannot process audio fast enough, dropping audio ...\n\n", __func__);
+                    LOGW("WARNING: buffer full, cannot process audio fast enough, dropping audio ...");
+                    LOGW("%d audio size, %d sample step", pcmf32_new.size(), 2*n_samples_step);
                     env->CallVoidMethod(circularBufferInstance, clear);
                     //audio.clear();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     continue;
                 }
 
                 if ((int) pcmf32_new.size() >= n_samples_step) {
-                    fprintf(stderr, "\n\n%s: WARNING: cannot process audio fast enough, dropping audio ...\n\n", __func__);
                     env->CallVoidMethod(circularBufferInstance, clear);
+                    LOGV("Collected enough data, let's start !");
                     //audio.clear();
                     break;
                 }
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
 
             const int n_samples_new = pcmf32_new.size();
@@ -317,7 +353,7 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
             // take up to params.length_ms audio from previous iteration
             const int n_samples_take = std::min((int) pcmf32_old.size(), std::max(0, n_samples_keep + n_samples_len - n_samples_new));
 
-            //printf("processing: take = %d, new = %d, old = %d\n", n_samples_take, n_samples_new, (int) pcmf32_old.size());
+            LOGV("processing: take = %d, new = %d, old = %d\n", n_samples_take, n_samples_new, (int) pcmf32_old.size());
 
             pcmf32.resize(n_samples_new + n_samples_take);
 
@@ -338,17 +374,18 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
                 continue;
             }
 
-            jshortArray audio = (jshortArray)env->CallObjectMethod(circularBufferInstance, get, 2000);
-            Java_com_example_whispercppstreaming_CircularBuffer_shortArrayToVector(env, audio, pcmf32_new, n_samples_30s);
+            jbyteArray audio = (jbyteArray)env->CallObjectMethod(circularBufferInstance, get, 2000);
+            byteArrayToFloatVector(env, audio, pcmf32_new, n_samples_30s);
             // audio.get(2000, pcmf32_new);
 
             if (::vad_simple(pcmf32_new, WHISPER_SAMPLE_RATE, 1000, params.vad_thold, params.freq_thold, false)) {
-                jshortArray audio = (jshortArray)env->CallObjectMethod(circularBufferInstance, get, params.step_ms);
-                Java_com_example_whispercppstreaming_CircularBuffer_shortArrayToVector(env, audio, pcmf32, n_samples_30s);
+                jbyteArray audio = (jbyteArray)env->CallObjectMethod(circularBufferInstance, get, params.step_ms);
+                byteArrayToFloatVector(env, audio, pcmf32, n_samples_30s);
                 // audio.get(params.length_ms, pcmf32);
+                LOGV("Threshold overcome!");
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
+                LOGW("Threshold not overcome, speak louder");
                 continue;
             }
 
@@ -382,26 +419,26 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
             wparams.prompt_n_tokens  = params.no_context ? 0       : prompt_tokens.size();
 
             if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
-                fprintf(stderr, "%s: failed to process audio\n", argv[0].c_str());
+                LOGE("%s: failed to process audio\n", argv[0].c_str());
                 return 6;
             }
 
             // print result;
             {
                 if (!use_vad) {
-                    printf("\33[2K\r");
+                    LOGV("\33[2K\r");
 
                     // print long empty line to clear the previous line
-                    printf("%s", std::string(100, ' ').c_str());
+                    LOGV("%s", std::string(100, ' ').c_str());
 
-                    printf("\33[2K\r");
+                    LOGV("\33[2K\r");
                 } else {
                     const int64_t t1 = (t_last - t_start).count()/1000000;
                     const int64_t t0 = std::max(0.0, t1 - pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
 
-                    printf("\n");
-                    printf("### Transcription %d START | t0 = %d ms | t1 = %d ms\n", n_iter, (int) t0, (int) t1);
-                    printf("\n");
+                    LOGV("\n");
+                    LOGV("### Transcription %d START | t0 = %d ms | t1 = %d ms\n", n_iter, (int) t0, (int) t1);
+                    LOGV("\n");
                 }
 
                 const int n_segments = whisper_full_n_segments(ctx);
@@ -409,7 +446,7 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
                     const char * text = whisper_full_get_segment_text(ctx, i);
 
                     if (params.no_timestamps) {
-                        printf("%s", text);
+                        LOGV("%s", text);
                         fflush(stdout);
 
                         if (params.fname_out.length() > 0) {
@@ -427,7 +464,7 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
 
                         output += "\n";
 
-                        printf("%s", output.c_str());
+                        LOGV("%s", output.c_str());
                         fflush(stdout);
 
                         if (params.fname_out.length() > 0) {
@@ -441,22 +478,26 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
                 }
 
                 if (use_vad){
-                    printf("\n");
-                    printf("### Transcription %d END\n", n_iter);
+                    LOGV("\n");
+                    LOGV("### Transcription %d END\n", n_iter);
                 }
             }
 
             ++n_iter;
 
             if (!use_vad && (n_iter % n_new_line) == 0) {
-                printf("\n");
-                __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "%s", "Kepasa?");
+                LOGV("\n");
+                LOGV("%s", "Kepasa?");
                 // Get the last sentence and send it to other thread
                 const int n_segments = whisper_full_n_segments(ctx);
+                LOGV("%s", "Kepasa2?");
                 std::string text = (const char *) whisper_full_get_segment_text(ctx, n_segments - 1);
+                LOGV("%s", "Kepasa3?");
                 {
                     std::lock_guard<std::mutex> lock(queueMutex);
+                    LOGV("%s", "Kepasa4?");
                     sentenceQueue.push(text);
+                    LOGV("%s", "Kepasa5?");
                 }
                 // Notify the condition variable
                 conditionVar.notify_one();
@@ -480,6 +521,7 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
         }
     }
 
+    LOGV("Transcription successfully stopped");
     whisper_print_timings(ctx);
     whisper_free(ctx);
 
