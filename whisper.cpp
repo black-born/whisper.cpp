@@ -1,4 +1,5 @@
 #include "whisper.h"
+#include <android/log.h>
 #ifdef WHISPER_USE_COREML
 #include "coreml/whisper-encoder.h"
 #endif
@@ -4134,6 +4135,7 @@ int whisper_full_with_state(
     // basically don't process anything that is less than 1.0s
     // see issue #39: https://github.com/ggerganov/whisper.cpp/issues/39
     if (seek_end < seek_start + (params.speed_up ? 50 : 100)) {
+        __android_log_print(ANDROID_LOG_VERBOSE, "Transcribing", "length is too small");
         return 0;
     }
 

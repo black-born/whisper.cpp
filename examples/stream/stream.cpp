@@ -164,7 +164,7 @@ void byteArrayToFloatVector(JNIEnv *env, jbyteArray byteArray, std::vector<float
         memcpy(&floatValue, &byteArrayElements[i], sizeof(float));
         floatVector.push_back(floatValue);
     }
-    LOGV("vector size: %d", floatVector.size());
+    LOGV("vector size: %zu", floatVector.size());
     env->ReleaseByteArrayElements(byteArray, byteArrayElements, JNI_ABORT);
 }
 
@@ -256,9 +256,7 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
 
     if (ctx == nullptr) {LOGV("%s", "failed to find model here");}
     else {LOGV("%s", "Model load Successfully");}
-    std::vector<float> pcmf32;
     std::vector<float> pcmf32_old;
-    std::vector<float> pcmf32_new;
 
     std::vector<whisper_token> prompt_tokens;
 
@@ -310,6 +308,9 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
     // main audio loop
     while (!stopLoopFlag->load()) {
 
+        std::vector<float> pcmf32;
+        std::vector<float> pcmf32_new;
+
         if (stopLoopFlag->load()) {
             __android_log_print(ANDROID_LOG_VERBOSE, "Stopping", "Transcribing successfully stopped");
             whisper_free(ctx);
@@ -334,6 +335,7 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
                     LOGW("%d audio size, %d sample step", pcmf32_new.size(), 2*n_samples_step);
                     env->CallVoidMethod(circularBufferInstance, clear);
                     //audio.clear();
+                    std::vector<float>().swap(pcmf32_new);
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     continue;
                 }
@@ -426,12 +428,12 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
             // print result;
             {
                 if (!use_vad) {
-                    LOGV("\33[2K\r");
+                    LOGV("[2K");
 
                     // print long empty line to clear the previous line
                     LOGV("%s", std::string(100, ' ').c_str());
 
-                    LOGV("\33[2K\r");
+                    LOGV("[2K");
                 } else {
                     const int64_t t1 = (t_last - t_start).count()/1000000;
                     const int64_t t0 = std::max(0.0, t1 - pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
@@ -441,7 +443,8 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
                     LOGV("\n");
                 }
 
-                const int n_segments = whisper_full_n_segments(ctx);
+                    const int n_segments = whisper_full_n_segments(ctx);
+                LOGV("n_segment: %d", n_segments);
                 for (int i = 0; i < n_segments; ++i) {
                     const char * text = whisper_full_get_segment_text(ctx, i);
 
@@ -486,21 +489,21 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
             ++n_iter;
 
             if (!use_vad && (n_iter % n_new_line) == 0) {
-                LOGV("\n");
-                LOGV("%s", "Kepasa?");
                 // Get the last sentence and send it to other thread
                 const int n_segments = whisper_full_n_segments(ctx);
-                LOGV("%s", "Kepasa2?");
-                std::string text = (const char *) whisper_full_get_segment_text(ctx, n_segments - 1);
-                LOGV("%s", "Kepasa3?");
-                {
-                    std::lock_guard<std::mutex> lock(queueMutex);
-                    LOGV("%s", "Kepasa4?");
-                    sentenceQueue.push(text);
-                    LOGV("%s", "Kepasa5?");
+                if (0 < n_segments) {
+                    std::string text = (const char *) whisper_full_get_segment_text(ctx,
+                                                                                    n_segments - 1);
+                    {
+                        std::lock_guard<std::mutex> lock(queueMutex);
+                        sentenceQueue.push(text);
+                    }
+                    // Notify the condition variable
+                    conditionVar.notify_one();
                 }
-                // Notify the condition variable
-                conditionVar.notify_one();
+                else {
+                    LOGV("Number of segment is 0, Nothing translatable inside the record");
+                }
 
                 // keep part of the audio for next iteration to try to mitigate word boundary issues
                 pcmf32_old = std::vector<float>(pcmf32.end() - n_samples_keep, pcmf32.end());
@@ -521,7 +524,7 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
         }
     }
 
-    LOGV("Transcription successfully stopped");
+    __android_log_print(ANDROID_LOG_VERBOSE, "Stopping", "Transcribing successfully stopped");
     whisper_print_timings(ctx);
     whisper_free(ctx);
 
