@@ -74,6 +74,7 @@ static struct whisper_context *whisper_init_from_asset(
 std::queue<std::string> sentenceQueue;
 std::mutex queueMutex;
 std::condition_variable conditionVar;
+bool dataReady = false;
 std::atomic<bool>* stopLoopFlag = new std::atomic<bool>(false);
 
 //  500 -> 00:05.000
@@ -127,6 +128,39 @@ bool whisper_params_parse(int argc, std::vector<std::string> argv, whisper_param
     return true;
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_whispercppstreaming_HomeFragment_getFirstSentenceQueue(JNIEnv *env, jobject /* this */) {
+    if (sentenceQueue.empty()) {
+        return nullptr;
+    }
+    return env->NewStringUTF(sentenceQueue.front().c_str());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_whispercppstreaming_HomeFragment_lockMutex(JNIEnv *env, jobject /* this */) {
+    // Lock the mutex
+    queueMutex.lock();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_whispercppstreaming_HomeFragment_unlockMutex(JNIEnv *env, jobject /* this */) {
+    // Unlock the mutex
+    queueMutex.unlock();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_whispercppstreaming_HomeFragment_waitForData(JNIEnv *env, jobject /* this */) {
+    std::unique_lock<std::mutex> lock(queueMutex);
+
+    // Wait until the data is ready
+    conditionVar.wait(lock, []{ return dataReady;});
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_whispercppstreaming_HomeFragment_dataNotReady(JNIEnv *env, jobject /* this */) {
+    dataReady = false;
+}
+
 void whisper_print_usage(int /*argc*/, std::vector<std::string> argv, const whisper_params & params) {
     LOGV("\n");
     LOGV("usage: %s [options]\n", argv[0].c_str());
@@ -158,10 +192,11 @@ void byteArrayToFloatVector(JNIEnv *env, jbyteArray byteArray, std::vector<float
     jsize length = env->GetArrayLength(byteArray);
     jbyte* byteArrayElements = env->GetByteArrayElements(byteArray, NULL);
 
-    for (int i = 0; i < length; i += sizeof(float)) {
-        float floatValue;
-        // Assuming little-endian byte order
-        memcpy(&floatValue, &byteArrayElements[i], sizeof(float));
+    const int16_t* pcmData = reinterpret_cast<const int16_t*>(byteArrayElements);
+    int numSamples = length / sizeof(int16_t);
+
+    for (int i = 0; i < numSamples; ++i) {
+        float floatValue = static_cast<float>(pcmData[i]) / 32768.0f; // Convert to [-1.0, 1.0] range
         floatVector.push_back(floatValue);
     }
     LOGV("vector size: %zu", floatVector.size());
@@ -327,14 +362,21 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
                     whisper_free(ctx);
                     return 0;
                 }
-                jbyteArray audio = (jbyteArray)env->CallObjectMethod(circularBufferInstance, get, params.step_ms);
+
+                jbyteArray audio = (jbyteArray)env->CallObjectMethod(circularBufferInstance, get, n_samples_step);
+                if (env->GetArrayLength(audio) == 0) {
+                    //LOGV("Not enough data waiting for more");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+
                 byteArrayToFloatVector(env, audio, pcmf32_new, n_samples_30s);
 
                 if ((int) pcmf32_new.size() > 2*n_samples_step) {
                     LOGW("WARNING: buffer full, cannot process audio fast enough, dropping audio ...");
                     LOGW("%d audio size, %d sample step", pcmf32_new.size(), 2*n_samples_step);
                     env->CallVoidMethod(circularBufferInstance, clear);
-                    //audio.clear();
+                    //audio.clear();=
                     std::vector<float>().swap(pcmf32_new);
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     continue;
@@ -367,6 +409,7 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
 
             pcmf32_old = pcmf32;
         } else {
+            // I'm never going here :)
             const auto t_now  = std::chrono::high_resolution_clock::now();
             const auto t_diff = std::chrono::duration_cast<std::chrono::milliseconds>(t_now - t_last).count();
 
@@ -499,7 +542,9 @@ extern "C" JNIEXPORT int JNICALL Java_com_example_whispercppstreaming_CircularBu
                         sentenceQueue.push(text);
                     }
                     // Notify the condition variable
-                    conditionVar.notify_one();
+                    dataReady = true;
+                    conditionVar.notify_all();
+                    LOGV("Thread notified, let's go!");
                 }
                 else {
                     LOGV("Number of segment is 0, Nothing translatable inside the record");
